@@ -1,19 +1,198 @@
-# BTP — Low-Power sEMG Gesture Classifier ASIC
+<p align="center">
+  <img src="docs/readme/banner.png" alt="sEMG gesture classifier on a tiny, fully integer chip" width="100%">
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/B.Tech%20project-EE%20·%20IIT%20Bombay-1f5fbf" alt="B.Tech project, IIT Bombay">
+  <img src="https://img.shields.io/badge/dataset-FORS--EMG%20·%2019%20subjects-2ca02c" alt="FORS-EMG">
+  <img src="https://img.shields.io/badge/classifier-INT8%20LDA-f59e0b" alt="INT8 LDA">
+  <img src="https://img.shields.io/badge/RTL-Verilog--2005%20·%20bit--exact-dc2626" alt="Verilog">
+  <img src="https://img.shields.io/badge/verify__all-18%2F18%20PASS-22314e" alt="18/18 checks pass">
+</p>
+
+> **TL;DR.** A low-cost prosthetic hand has to read the wearer's forearm muscles on a tiny, cheap,
+> low-power chip. We built that chip's digital core:
+> - **8–24 surface-EMG electrodes in, one hand gesture out every 99.5 ms**;
+> - features made from **add, compare and shift only**, and an **INT8 LDA with a single 8 × 8 multiplier**;
+> - **77.6 %** on people the model has never seen (4 gestures, leave-one-subject-out on FORS-EMG), and
+>   **86.4 %** after a one-minute calibration with one recording per gesture;
+> - **bit-exact Verilog**, verified against a Python golden model, that splits across **1–3 chained boards**
+>   with only 96 bits per decision passing between them.
 
 B.Tech project, Department of Electrical Engineering, IIT Bombay (BioNICS group, advisor Prof. Laxmeesha Somappa).
 Team: Vinay Hariharan, Sudhindra Sahoo, Yashvardhan Khandegar, Digvijay Kumbhar.
 
-Surface EMG from 8–24 forearm electrodes is classified into hand/wrist gestures by a fixed-function,
-fully integer digital core: per-channel time-domain features, an integer shift-normaliser, and an
-INT8 Linear Discriminant Analysis (LDA) classifier with one multiplier. Everything is verified
-bit-exactly against a Python golden model and evaluated subject-independently on the public
-FORS-EMG dataset.
+---
 
-## Headline results
+## 1 · The problem
 
-All accuracies are leave-one-subject-out (LOSO) on FORS-EMG: the test subject is never seen in training.
-Mean ± 95% CI over subjects; "pp" = percentage points. The full write-up is the paper
-[`docs/paper/BTP_paper.pdf`](docs/paper/BTP_paper.pdf); raw script outputs are in [`docs/results/`](docs/results/).
+When you make a fist, the muscles in your forearm fire, and electrodes on the skin pick up a noisy
+electrical signal: **surface electromyography (sEMG)**. A prosthetic hand can use that signal to decide
+which gesture the wearer wants. To be wearable and affordable, the decision has to be made:
+
+- **in real time**: a new decision every ~100 ms;
+- **on a small, fixed-function chip**: no floating point, almost no multipliers, a few kbit of memory;
+- **for a new user**: the factory model is trained on other people, so we always test on a person
+  the model has never seen (**leave-one-subject-out, LOSO**).
+
+## 2 · A real recording through the chip
+
+Below, a real 8-channel recording of a person who was **left out of training** is streamed through the
+**bit-exact model of the chip**: the same integers the Verilog computes. Every 98 samples the chip turns
+the last 196-sample window into 40 INT8 features, scores the 4 gestures and picks the largest score.
+
+<p align="center"><img src="docs/readme/emg_to_decision.gif" alt="Animation: eight EMG channels scroll past, a window slides along them, a grid of 40 integer features updates, four score bars change and the chip's decision is shown next to the true gesture" width="100%"></p>
+
+<sub>Data and model: [`RTL/tb/mb_data/`](RTL/tb/mb_data), the same stream the multi-board testbench runs
+(subject 6, trial 1, 2 s of each gesture). The chip gets 72 of the 76 single-gesture windows right; the RTL
+reproduces all 79 decisions bit for bit.</sub>
+
+## 3 · The signal chain
+
+```mermaid
+flowchart LR
+    E["8–24 electrodes<br/>ADC pods: 8 ch each<br/>20–450 Hz band-pass<br/>+ 50 Hz notch, 8-bit, 985 Hz"] --> S1
+    subgraph CHIP["emg_top: one board, one 256 kHz clock"]
+        S1["Stage 1 · emg_feat_accum<br/>per sample, per channel:<br/>SABS · WL · ZC · SSC · POW<br/>(two 98-sample banks)"] --> S2
+        S2["Stage 2 · emg_shift_norm<br/>once per stride:<br/>x_q = (Σ − μ) >> k<br/>→ INT8"] --> S3
+        S3["Stage 3 · emg_lda_mac<br/>one 8 × 8 multiplier<br/>INT32 accumulator<br/>streaming argmax"] --> L
+        L["emg_chain_link<br/>adds the other boards'<br/>partial sums bit-serially"]
+    end
+    L --> O(["class_valid, class_out<br/>every 99.5 ms"])
+    H["host / MCU<br/>(config only: μ, k, W, b)"] -.-> CHIP
+    classDef io fill:#e8f0fc,stroke:#1f5fbf,color:#0b1a33
+    classDef st fill:#e3f4e3,stroke:#2ca02c,color:#0e3b12
+    classDef ch fill:#fff4dc,stroke:#e0a100,color:#3d2c00
+    class E,H,O io
+    class S1,S2,S3 st
+    class L ch
+```
+
+| | |
+|---|---|
+| Window / stride | 196 / 98 samples (199 ms / 99.5 ms), ping-pong banks so no sample is stored |
+| Features | 5 per channel, 40 for 8 channels: SABS (Σ\|x\|), WL (Σ\|Δx\|), ZC, SSC, POW (Mitchell Σx²) |
+| Classifier | 4-class INT8 LDA in difference form: 3 rows × 40 = 120 MACs, one weight scale |
+| Clock | one 256 kHz clock per board; decision ≈ 266 cycles (≈ 1 ms) after the stride's last sample |
+| Memory | ≈ 3.6 kbit per board |
+
+### Stage 1: features without a multiplier
+
+Every sample, each channel updates five running sums. All of them need only **add, subtract, absolute
+value, compare and shift**. The power term uses **Mitchell's approximation** of x²: find the leading one
+of |x| at position p, then x² ≈ (|x| << (p+1)) − (1 << 2p). It is never too large and at most 25 % too
+small, and the classifier does not mind (77.39 % against 77.45 % for the float reference).
+
+<p align="center"><img src="docs/readme/stage1_features.gif" alt="Animation: one channel of real Wrist Flexion EMG drawn sample by sample, zero crossings and slope changes marked, five running-sum bars growing, then the shift normaliser turning the sums into INT8 values" width="100%"></p>
+
+<p align="center"><img src="docs/report/figures/mitchell.png" alt="Exact square and Mitchell-1 approximation, and its error" width="80%"></p>
+
+### Stage 2 and 3: an integer normaliser and an INT8 LDA
+
+The usual z-score `(x − mean) / std` needs a divider. Stage 2 replaces it with a subtract and an
+arithmetic shift, `x_q = clip((Σ − μ + 2^(k−1)) >> k, −128, 127)`, with μ and k fitted on the training
+people. Stage 3 is a **Linear Discriminant Analysis**: one dot product per class, done on a single
+8 × 8 multiplier into an INT32 accumulator, and the largest score wins. In the 2-D picture below
+(the LDA's two main directions) each gesture forms a cloud, and the LDA puts its boundaries between them.
+
+## 4 · How the design was chosen
+
+Every choice was made with a controlled, paired experiment: same 19 people, same windows, same folds,
+Wilcoxon test per subject, 95 % confidence interval of the difference.
+
+**The gesture set mattered most.** The first set (Hand Close, Hand Open, Index, Index + Little) stalled
+at about 65 %: Index and Index + Little alone caused ~40 % of all errors, because they use overlapping deep
+finger muscles. Choosing gestures that use different, superficial muscles (Hand Close, Hand Open, Wrist
+Flexion, Wrist Extension) gained **+14.1 points (p = 3.8 × 10⁻⁹)**, more than any model change.
+Merging all 12 gestures into 4 groups instead of dropping 8 was worse for all 19 people (60.9 % vs 77.8 %).
+
+**Model capacity did not matter.** MLPs of five widths, logistic regression, linear SVM and LDA are
+statistically tied; the trees that fit a 10 KB budget are worse. LDA won on hardware cost: closed-form
+training, 160 MACs, 176 bytes.
+
+<p align="center">
+  <img src="docs/report/figures/gesture_sets.png" alt="Accuracy for four gesture vocabularies" width="40%">
+  <img src="docs/report/figures/classifiers.png" alt="Eight classifiers compared, and accuracy against memory" width="58%">
+</p>
+
+**A CNN on the raw signal was not worth it.** Two small CNNs (11.7–12.1 k parameters) reached
++1.3 points (not significant) and +2.7 points (p = 0.008) over the INT8 LDA, for **3,700–4,700 × the
+arithmetic** (595–752 k MACs against 160). After per-user calibration the CNN's lead was +2.4 points,
+below the agreed +3-point bar, at ≈ 870 × the arithmetic, so the LDA was kept.
+
+**INT8 is free.** Over 28 FP32-vs-INT8 comparisons the average cost was **+0.18 points**.
+
+## 5 · A new user: one-minute calibration
+
+A model trained on other people works, but every arm is different: electrode position, skin, muscle size.
+The fix is cheap for an LDA. Record **one repetition of each gesture** from the new user, blend the class
+centres and the covariance with theirs (`μ ← (1 − λ) μ_global + λ μ_user`, λ = 0.5), and recompute W and b
+in closed form. The chip does not change: only its weight registers are rewritten.
+
+<p align="center"><img src="docs/readme/lda_space.gif" alt="Animation: training data of 18 people as faint clouds, a new user's windows appearing offset from the class centres with many errors, then the class centres sliding toward the new user and the accuracy rising" width="85%"></p>
+
+<sub>Subject 15, the hardest user, made with `analysis/K_4_LDA_Calib.py`'s own functions. The animation
+trains on all 18 other subjects in this repository's copy of the dataset, so its numbers (60.8 → 90.0 %)
+differ slightly from the logged run on 17 (59.3 → 89.5 %).</sub>
+
+Across all users, calibration helps **every one of them**:
+
+<p align="center"><img src="docs/readme/calibration.gif" alt="Animation: for each of 18 users a bar grows from the global model's accuracy to the calibrated accuracy; the mean moves from 78.0 to 86.4 percent" width="85%"></p>
+
+<sub>Numbers from [`docs/results/lda_calibration_18_subjects.txt`](docs/results/lda_calibration_18_subjects.txt):
+78.0 → 86.4 %, +8.3 points [+4.4, +12.3], Wilcoxon p = 0.0002, 18 / 18 improve.</sub>
+
+## 6 · Hardware: one board, or a chain of boards
+
+The core on `main` is built to be chained. Each board is one `emg_top` with one 8-channel ADC pod;
+1–3 boards act as one classifier for 8–24 electrodes.
+
+<p align="center"><img src="docs/paper/figures/system.png" alt="Three boards: ADC pods, emg_top, Stage 3 partial sums and emg_chain_link, shared clock and wired-AND ready line" width="100%"></p>
+
+**Why so little crosses between boards.** The LDA decision only needs the score *differences* to class 0.
+Each board keeps the rows W′_c = W_c − W_0 for its own features and computes three partial sums
+p₁, p₂, p₃. The totals D_c = Σ p_c decide: class = argmax{0, D₁, D₂, D₃}, exactly the single-chip answer.
+So per decision only **three 32-bit numbers** travel, one bit per clock, least significant bit first, and
+each board adds its own bit as they pass with **one full adder and a carry flip-flop**:
+
+<p align="center"><img src="docs/readme/chain_serial_add.gif" alt="Animation: three boards; bits of the partial sums flow from the tail board to the head board, each board adding its own bit with a carry, and the head comparing the totals and deciding Wrist Extension" width="100%"></p>
+
+- **Synchronisation.** One 256 kHz clock for all boards. The head's `core_en` is passed down the chain
+  (`run`), so every board's sample timer starts in the same cycle. A wired-AND ready line starts the
+  transfer once every board has finished Stage 3.
+- **Board roles** (head, middle, tail) and board ids are detected automatically from which neighbours are present.
+
+<details>
+<summary><b>Inside one board</b> (block diagram) and <b>one stride in simulation</b> (waveform)</summary>
+
+<p align="center"><img src="docs/paper/figures/board.png" alt="Block diagram of one board: SPI ADC interface, Stage 1, Stage 2, Stage 3, chain link, configuration registers and timing" width="100%"></p>
+<p align="center"><img src="docs/waveforms/mb_stride.png" alt="Simulated waveform: two boards finish Stage 3, the ready barrier rises, the partial sums are sent bit-serially and the head decides" width="90%"></p>
+
+</details>
+
+## 7 · Verification
+
+```bash
+cd RTL
+python3 tb/verify_all.py       # about 4 min, needs iverilog; prints ALL PASS or what failed
+```
+
+| Check | Result |
+|---|---|
+| `emg_chain_link` unit test, 1–4 boards, 3000 random strides each (large, small, negative and tied sums) | pass |
+| Mutation test: 8 bugs planted one at a time (dropped carry, wrong tie-break, stale class, …) | 8 / 8 caught |
+| Whole chip on real FORS-EMG, board splits 8 · 4+4 · 2+6 · 6+2 · 5+3 · 3+3+2 | 79 / 79 decisions bit-exact for every split |
+| Golden model vs the original single-chip LDA | 79 / 79 equal |
+| Bit-exact chip model vs software INT8 LDA, 18 new users | 77.61 % vs 77.83 %, no difference (p = 0.49) |
+
+Raw output: [`docs/results/rtl_verify_all.txt`](docs/results/rtl_verify_all.txt). During development the
+feature ALU was also checked exhaustively (all 196,608 input combinations), and the single-chip version passed
+a cocotb chip test for 8, 12, 16, 20 and 24 channels.
+
+## 8 · Headline results
+
+All accuracies are leave-one-subject-out on FORS-EMG: the test subject is never seen in training.
+Mean ± 95 % CI over subjects; "pp" = percentage points. Full write-up: [`docs/paper/BTP_paper.pdf`](docs/paper/BTP_paper.pdf).
 
 | Question | Result |
 |---|---|
@@ -30,11 +209,12 @@ Mean ± 95% CI over subjects; "pp" = percentage points. The full write-up is the
 
 Details: [`docs/technical_summary.md`](docs/technical_summary.md) (model search) and [`RTL/README.md`](RTL/README.md) (hardware).
 
-## Repository map
+---
+
+## Repository
 
 ```
 .
-├── README.md
 ├── analysis/                        software pipeline and model search (all on FORS-EMG, LOSO)
 │   ├── K_4_LDA_Analysis.py          MAIN pipeline: loading, filtering, windowing, integer features, INT8 LDA
 │   ├── K_4_LDA_HW_Experiments.py    choice of the multiplier-free feature set (H1-H6) and the shift normaliser
@@ -49,27 +229,52 @@ Details: [`docs/technical_summary.md`](docs/technical_summary.md) (model search)
 ├── golden_model/
 │   ├── lda_golden_model.py          bit-exact Python model of the chip (Stages 1-3); training + test vectors
 │   └── K_4_LDA_Golden_LOSO.py       chip model vs software LDA on FORS-EMG (paired LOSO)
-├── RTL/                             Verilog of the chip + chip-level cocotb testbench (RTL/README.md)
+├── RTL/                             Verilog of the chip + testbenches (see RTL/README.md)
 ├── docs/
 │   ├── paper/                       the full paper: LaTeX source, figures, PDF (BTP_paper.pdf)
 │   ├── presentation/                final slides (pptx + pdf) and the chronological waveform diagram
+│   ├── readme/                      banner + animations of this page, and the script that makes them
 │   ├── results/                     raw outputs of the scripts behind every number (see results/README.md)
 │   ├── technical_summary.md         model search: preprocessing, INT8 scheme, results
+│   ├── waveforms/                   simulated waveforms of the chip
 │   └── report/                      earlier project report (single-chip version, LaTeX, figures, PDF)
 └── archive/                         FORS-EMG dataset (Subject<i>/<orientation>/<gesture>-<trial>.mat)
 ```
 
+<details open>
+<summary><b>The Verilog modules</b> (<code>RTL/</code>)</summary>
+
+| File | Stage | What it does |
+|---|---|---|
+| `emg_spi_adc.v` | — | CONVST timer, DRDY sync, SPI burst read of the ADC pod |
+| `emg_feat_alu.v`, `emg_mitchell_sq.v` | 1 | per-sample \|x\|, \|Δx\|, zero crossing, slope sign change, Mitchell square |
+| `emg_feat_accum.v` | 1 | running sums of every channel in two ping-pong banks; `stride_done` every 98 samples |
+| `emg_shift_norm.v` | 2 | `clip(((Σ − μ) + 2^(k−1)) >>> k)` → INT8 `x_q` |
+| `emg_lda_mac.v` | 3 | one signed 8 × 8 multiplier, INT32 accumulator, streaming argmax |
+| `emg_chain_link.v` | — | head/tail detection, board id, common run, ready barrier, bit-serial adder, head argmax |
+| `emg_core_ctrl.v`, `emg_cfg_regs.v` | — | sequencing and first-decision mask; writable μ, k, W, b and settings |
+| `emg_top.v` | — | the chip top |
+
+</details>
+
 ## Setup
 
 ```bash
-pip install numpy scipy scikit-learn tabulate tqdm        # every script
-pip install torch                                          # MLP and CNN scripts only
-brew install icarus-verilog && pip install cocotb          # RTL simulation (macOS; apt install iverilog on Linux)
+pip install numpy scipy scikit-learn tabulate tqdm matplotlib   # every script
+pip install torch                                                 # MLP and CNN scripts only
+brew install icarus-verilog && pip install cocotb                 # RTL simulation (macOS; apt install iverilog on Linux)
 ```
 
-Run every script from the repository root, for example `python analysis/K_4_LDA_Analysis.py`. The dataset is found automatically in `archive/`; to use another
-copy, set `BASE_DIR` at the top of `analysis/K_4_LDA_Analysis.py`. The scripts in `golden_model/` import their data loading from `analysis/K_4_LDA_Analysis.py`, so every script sees the
-same filter, windows and folds. Scripts print their results; the older analysis scripts also save a results CSV in the working directory.
+Run every script from the repository root, for example `python analysis/K_4_LDA_Analysis.py`. The dataset is
+found automatically in `archive/`; to use another copy, set `BASE_DIR` at the top of
+`analysis/K_4_LDA_Analysis.py`. The scripts in `golden_model/` import their data loading from
+`analysis/K_4_LDA_Analysis.py`, so every script sees the same filter, windows and folds.
+
+To rebuild the banner and animations of this page:
+
+```bash
+python docs/readme/make_readme_figures.py        # about 2 min; "fast" skips the two that load the whole dataset
+```
 
 ## Evaluation protocol (shared by every script)
 
@@ -78,9 +283,9 @@ same filter, windows and folds. Scripts print their results; the older analysis 
 - Leave-one-subject-out: the held-out subject is never seen in training, normalisation or calibration.
   Inside the training subjects, trial 5 is the validation set; trials 1–4 train.
 - Windows are cut after the split, so overlapping windows never leak across it.
-- Comparisons are paired per subject (Wilcoxon signed-rank test, 95% CI of the paired difference).
+- Comparisons are paired per subject (Wilcoxon signed-rank test, 95 % CI of the paired difference).
 
-## Development history (short)
+## Development history
 
 1. **Gesture set.** The original set {Hand Close, Hand Open, Index, Index Little} capped at about 65 %:
    Index ↔ Index Little alone caused about 40 % of errors. Switching to Hand Close, Hand Open, Wrist
@@ -97,50 +302,21 @@ same filter, windows and folds. Scripts print their results; the older analysis 
    Digvijay explored the programmable alternative). Extensible mother–daughter design: one compute
    core, 1–3 daisy-chained 8-channel ADC pods (8–24 electrodes) set by one register.
 5. **Verification.** A bit-exact golden model (`golden_model/lda_golden_model.py`) drives exhaustive unit tests and a
-   chip-level cocotb testbench; the chip reproduces the golden model's decisions bit for bit.
-
-## Multi-board system (`main`)
-
-The chip on `main` is built to be chained. Each board is one `emg_top` with one 8-channel ADC
-pod; 1–3 boards in a chain act as one LDA classifier for 8–24 electrodes.
-
-```
- ADC pod (ch 0-2)      ADC pod (ch 3-5)      ADC pod (ch 6-7)
-       │                     │                     │
- ┌─────▼──────┐        ┌─────▼──────┐        ┌─────▼──────┐
- │ Board 0    │◄─sums──│ Board 1    │◄─sums──│ Board 2    │
- │ (head)     │──run──►│            │──run──►│ (tail)     │
- └─────┬──────┘        └────────────┘        └────────────┘
-       ▼ class_out = argmax(0, D1, D2, D3)
-```
-
-- **How it splits the work.** Every board runs Stages 1–2 (features, normaliser) on its own channels
-  and Stage 3 on its own slice of the weights. Stage 3 uses the K−1 difference rows W′_c = W_c − W_0,
-  so each board only produces three partial sums p_1..p_3.
-- **What crosses between boards.** Only those three 32-bit sums, bit-serially, LSB first, tail → head.
-  Each board adds its own sums with one full adder as the bits pass. The head adds the bias b′ and
-  picks argmax(0, D_1, D_2, D_3), which equals the single-chip LDA decision.
-- **Synchronisation.** One 256 kHz clock for all boards. The head's `core_en` is passed down the chain
-  (`run`), so every board's sample timer starts in the same cycle. A wired-AND ready line starts the
-  sum transfer once every board has finished Stage 3.
-- **Verified.** `python3 RTL/tb/verify_all.py` (from `RTL/`: `python3 tb/verify_all.py`, about 4 min)
-  runs 18 checks and prints ALL PASS or what failed:
-  - `emg_chain_link` alone, 1–4 boards, 3000 random strides each (large, small, negative and tied
-    sums; K−1 = 3, 2, 1), checked against sums and argmax computed inside the testbench;
-  - 8 deliberate bugs put into `emg_chain_link` one at a time: the unit test must catch every one;
-  - the whole chip on subject 6, trial 1 of FORS-EMG (4 gestures, 7840 samples) for the splits
-    8, 4+4, 2+6, 6+2, 5+3 and 3+3+2: all 79 decisions bit-exact with the golden model, which
-    itself equals the original single-chip LDA on all 79. 72 of 76 single-gesture windows are correct.
-
-Details, ports and commands: [`RTL/README.md`](RTL/README.md).
+   chip-level testbench; the chip reproduces the golden model's decisions bit for bit.
 
 ## Branches
 
-- `main` — the chained multi-board version described above.
-- `single_chip` — the earlier single-board LDA chip (two clocks, 1 MHz core, up to 24 channels on one
+- `main`: the chained multi-board version described above.
+- `single_chip`: the earlier single-board LDA chip (two clocks, 1 MHz core, up to 24 channels on one
   core, cocotb chip test). This was `main` until 12 Nov 2026.
-- `processor_flexibility` — the chip as a configurable feature front end for a microcontroller:
+- `processor_flexibility`: the chip as a configurable feature front end for a microcontroller:
   on-chip LDA removed, real TI ADS1299 ADC interface, SPI slave link to an MCU, on-chip IIR filter,
   configurable windows, fault flags. See `LDAcore_with_proc/README.md` on that branch.
 
 The full project report is in [`docs/report/`](docs/report/).
+
+## Acknowledgements
+
+BioNICS group, Department of Electrical Engineering, IIT Bombay, and Prof. Laxmeesha Somappa.
+Data: the FORS-EMG dataset (19 subjects, 12 gestures, 3 forearm orientations, 8 channels at 985 Hz).
+Mitchell's approximation: J. N. Mitchell, *Computer multiplication and division using binary logarithms*, IRE Trans. Electronic Computers, 1962.
